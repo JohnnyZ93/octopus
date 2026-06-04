@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bestruirui/octopus/internal/helper"
@@ -270,9 +271,30 @@ func (ra *relayAttempt) forward() (int, error) {
 	// 复制请求头
 	ra.copyHeaders(outboundRequest)
 
+	// 首字超时：仅流式请求启用。计时从「发出请求」开始，覆盖「等待上游响应头」
+	// 与「等待首个 token」两个阶段。收到首个 token 即停止；超时则取消请求上下文，
+	// 中断本次尝试，由上层循环切换到下一个渠道重试（故障转移）。
+	isStream := ra.internalRequest.Stream != nil && *ra.internalRequest.Stream
+	var firstTokenTimer *time.Timer
+	var firstTokenTimedOut atomic.Bool
+	if isStream && ra.firstTokenTimeOutSec > 0 {
+		reqCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		firstTokenTimer = time.AfterFunc(time.Duration(ra.firstTokenTimeOutSec)*time.Second, func() {
+			firstTokenTimedOut.Store(true)
+			cancel()
+		})
+		defer firstTokenTimer.Stop()
+		outboundRequest = outboundRequest.WithContext(reqCtx)
+	}
+
 	// 发送请求
 	response, err := ra.sendRequest(outboundRequest)
 	if err != nil {
+		if firstTokenTimedOut.Load() {
+			log.Warnf("first token timeout (%ds) while waiting for response headers, switching channel", ra.firstTokenTimeOutSec)
+			return 0, fmt.Errorf("first token timeout (%ds)", ra.firstTokenTimeOutSec)
+		}
 		return 0, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer response.Body.Close()
@@ -287,8 +309,8 @@ func (ra *relayAttempt) forward() (int, error) {
 	}
 
 	// 处理响应
-	if ra.internalRequest.Stream != nil && *ra.internalRequest.Stream {
-		if err := ra.handleStreamResponse(ctx, response); err != nil {
+	if isStream {
+		if err := ra.handleStreamResponse(ctx, response, firstTokenTimer, &firstTokenTimedOut); err != nil {
 			return response.StatusCode, err
 		}
 		return response.StatusCode, nil
@@ -334,7 +356,7 @@ func (ra *relayAttempt) sendRequest(req *http.Request) (*http.Response, error) {
 }
 
 // handleStreamResponse 处理流式响应
-func (ra *relayAttempt) handleStreamResponse(ctx context.Context, response *http.Response) error {
+func (ra *relayAttempt) handleStreamResponse(ctx context.Context, response *http.Response, firstTokenTimer *time.Timer, firstTokenTimedOut *atomic.Bool) error {
 	if ct := response.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "text/event-stream") {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 16*1024))
 		return fmt.Errorf("upstream returned non-SSE content-type %q for stream request: %s", ct, string(body))
@@ -365,33 +387,28 @@ func (ra *relayAttempt) handleStreamResponse(ctx context.Context, response *http
 		}
 	}()
 
-	var firstTokenTimer *time.Timer
-	var firstTokenC <-chan time.Time
-	if firstToken && ra.firstTokenTimeOutSec > 0 {
-		firstTokenTimer = time.NewTimer(time.Duration(ra.firstTokenTimeOutSec) * time.Second)
-		firstTokenC = firstTokenTimer.C
-		defer func() {
-			if firstTokenTimer != nil {
-				firstTokenTimer.Stop()
-			}
-		}()
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			log.Infof("client disconnected, stopping stream")
 			return nil
-		case <-firstTokenC:
-			log.Warnf("first token timeout (%ds), switching channel", ra.firstTokenTimeOutSec)
-			_ = response.Body.Close()
-			return fmt.Errorf("first token timeout (%ds)", ra.firstTokenTimeOutSec)
 		case r, ok := <-results:
 			if !ok {
 				log.Infof("stream end")
 				return nil
 			}
 			if r.err != nil {
+				// 首字超时会取消请求上下文，使读取在收到首个 token 前报错；
+				// 此时返回首字超时错误，触发上层故障转移切换渠道。
+				if firstToken && firstTokenTimedOut.Load() {
+					log.Warnf("first token timeout (%ds), switching channel", ra.firstTokenTimeOutSec)
+					return fmt.Errorf("first token timeout (%ds)", ra.firstTokenTimeOutSec)
+				}
+				// 客户端断开，停止即可，不必切换渠道。
+				if ctx.Err() != nil {
+					log.Infof("client disconnected, stopping stream")
+					return nil
+				}
 				log.Warnf("failed to read event: %v", r.err)
 				return fmt.Errorf("failed to read stream event: %w", r.err)
 			}
@@ -403,15 +420,9 @@ func (ra *relayAttempt) handleStreamResponse(ctx context.Context, response *http
 			if firstToken {
 				ra.metrics.SetFirstTokenTime(time.Now())
 				firstToken = false
+				// 收到首个有效 token，停止首字计时，余下流不再受其约束。
 				if firstTokenTimer != nil {
-					if !firstTokenTimer.Stop() {
-						select {
-						case <-firstTokenTimer.C:
-						default:
-						}
-					}
-					firstTokenTimer = nil
-					firstTokenC = nil
+					firstTokenTimer.Stop()
 				}
 			}
 

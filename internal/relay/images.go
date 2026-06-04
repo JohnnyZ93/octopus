@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bestruirui/octopus/internal/helper"
@@ -383,10 +384,10 @@ func buildImagesResponseContentForLog(stream bool, upstreamCT string, usage *ima
 	}
 	// 不记录 b64_json，仅记录 usage
 	type respForLog struct {
-		Stream      bool        `json:"stream"`
-		ContentType string      `json:"content_type,omitempty"`
+		Stream      bool         `json:"stream"`
+		ContentType string       `json:"content_type,omitempty"`
 		Usage       *imagesUsage `json:"usage,omitempty"`
-		Note        string      `json:"note,omitempty"`
+		Note        string       `json:"note,omitempty"`
 	}
 	obj := respForLog{
 		Stream:      stream,
@@ -579,6 +580,22 @@ func imagesAttempt(
 	// Header 透传：复制下游 header，过滤 hop-by-hop 与鉴权相关
 	copyHeadersToUpstream(req, c, channel, channelKey, contentType, stream)
 
+	// 首字超时：仅流式请求启用。计时从「发出请求」开始，覆盖「等待上游响应头」
+	// 与「等待首个事件」两个阶段。收到首个事件即停止；超时则取消请求上下文，
+	// 中断本次尝试，由上层循环切换到下一个渠道重试（故障转移）。
+	var firstTokenTimer *time.Timer
+	var firstTokenTimedOut atomic.Bool
+	if stream && firstTokenTimeOutSec > 0 {
+		reqCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		firstTokenTimer = time.AfterFunc(time.Duration(firstTokenTimeOutSec)*time.Second, func() {
+			firstTokenTimedOut.Store(true)
+			cancel()
+		})
+		defer firstTokenTimer.Stop()
+		req = req.WithContext(reqCtx)
+	}
+
 	// 发送请求
 	httpClient, err := helper.ChannelHttpClient(channel)
 	if err != nil {
@@ -587,6 +604,10 @@ func imagesAttempt(
 
 	respUp, err := httpClient.Do(req)
 	if err != nil {
+		if firstTokenTimedOut.Load() {
+			log.Warnf("first token timeout (%ds) while waiting for response headers, switching channel", firstTokenTimeOutSec)
+			return 0, false, nil, "", fmt.Errorf("first token timeout (%ds)", firstTokenTimeOutSec)
+		}
 		return 0, false, nil, "", fmt.Errorf("failed to send request: %w", err)
 	}
 	defer respUp.Body.Close()
@@ -599,7 +620,7 @@ func imagesAttempt(
 			b, _ := io.ReadAll(io.LimitReader(respUp.Body, imagesUpstreamErrorBodyLimit))
 			return respUp.StatusCode, false, nil, upstreamCT, fmt.Errorf("upstream error: %d: %s", respUp.StatusCode, string(b))
 		}
-		u, w, err := proxySSE(ctx, c, respUp, firstTokenTimeOutSec, metrics)
+		u, w, err := proxySSE(ctx, c, respUp, firstTokenTimer, &firstTokenTimedOut, metrics)
 		return respUp.StatusCode, w, u, upstreamCT, err
 	}
 
@@ -717,7 +738,7 @@ func proxyNonStream(c *gin.Context, respUp *http.Response) (*imagesUsage, bool, 
 }
 
 // proxySSE 将上游 SSE 逐行解析 event/data/空行并透传到下游；首事件计为 FirstTokenTime；支持 FirstTokenTimeOut 切换。
-func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstTokenTimeOutSec int, metrics *imagesRelayMetrics) (*imagesUsage, bool, error) {
+func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstTokenTimer *time.Timer, firstTokenTimedOut *atomic.Bool, metrics *imagesRelayMetrics) (*imagesUsage, bool, error) {
 	if ct := respUp.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "text/event-stream") {
 		b, _ := io.ReadAll(io.LimitReader(respUp.Body, imagesUpstreamErrorBodyLimit))
 		return nil, false, fmt.Errorf("upstream returned non-SSE content-type %q for stream request: %s", ct, string(b))
@@ -753,21 +774,9 @@ func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstT
 		}
 	}()
 
-	var firstTokenTimer *time.Timer
-	var firstTokenC <-chan time.Time
-	if firstTokenTimeOutSec > 0 {
-		firstTokenTimer = time.NewTimer(time.Duration(firstTokenTimeOutSec) * time.Second)
-		firstTokenC = firstTokenTimer.C
-		defer func() {
-			if firstTokenTimer != nil {
-				firstTokenTimer.Stop()
-			}
-		}()
-	}
-
 	var (
-		firstWrite      = true
-		currentEvent    string
+		firstWrite       = true
+		currentEvent     string
 		completedScanner = newUsageScanner()
 	)
 
@@ -777,11 +786,6 @@ func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstT
 			log.Infof("client disconnected, stopping stream")
 			return completedScanner.Usage(), c.Writer.Written(), nil
 
-		case <-firstTokenC:
-			log.Warnf("first token timeout (%ds), switching channel", firstTokenTimeOutSec)
-			_ = respUp.Body.Close()
-			return completedScanner.Usage(), c.Writer.Written(), fmt.Errorf("first token timeout (%ds)", firstTokenTimeOutSec)
-
 		case r, ok := <-results:
 			if !ok {
 				return completedScanner.Usage(), c.Writer.Written(), nil
@@ -790,6 +794,17 @@ func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstT
 				return completedScanner.Usage(), c.Writer.Written(), nil
 			}
 			if r.err != nil {
+				// 首字超时会取消请求上下文，使读取在收到首个事件前报错；
+				// 此时返回首字超时错误，触发上层故障转移切换渠道。
+				if firstWrite && firstTokenTimedOut.Load() {
+					log.Warnf("first token timeout, switching channel")
+					return completedScanner.Usage(), c.Writer.Written(), fmt.Errorf("first token timeout")
+				}
+				// 客户端断开，停止即可，不必切换渠道。
+				if ctx.Err() != nil {
+					log.Infof("client disconnected, stopping stream")
+					return completedScanner.Usage(), c.Writer.Written(), nil
+				}
 				return completedScanner.Usage(), c.Writer.Written(), fmt.Errorf("failed to read stream line: %w", r.err)
 			}
 
@@ -816,15 +831,9 @@ func proxySSE(ctx context.Context, c *gin.Context, respUp *http.Response, firstT
 			if firstWrite {
 				metrics.SetFirstTokenTime(time.Now())
 				firstWrite = false
+				// 收到首个有效事件，停止首字计时，余下流不再受其约束。
 				if firstTokenTimer != nil {
-					if !firstTokenTimer.Stop() {
-						select {
-						case <-firstTokenTimer.C:
-						default:
-						}
-					}
-					firstTokenTimer = nil
-					firstTokenC = nil
+					firstTokenTimer.Stop()
 				}
 			}
 		}

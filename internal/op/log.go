@@ -190,6 +190,8 @@ func relayLogCleanup(ctx context.Context) error {
 	}
 
 	cutoffTime := time.Now().Add(-time.Duration(keepPeriod) * 24 * time.Hour).Unix()
+	relayLogFlushLock.Lock()
+	defer relayLogFlushLock.Unlock()
 	return db.GetDB().WithContext(ctx).Where("time < ?", cutoffTime).Delete(&model.RelayLog{}).Error
 }
 
@@ -286,10 +288,17 @@ func RelayLogStripContent(logs []model.RelayLog) {
 }
 
 func RelayLogClear(ctx context.Context) error {
+	relayLogFlushLock.Lock()
+	defer relayLogFlushLock.Unlock()
+
+	if err := db.GetDB().WithContext(ctx).Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.RelayLog{}).Error; err != nil {
+		return err
+	}
+
 	relayLogCacheLock.Lock()
 	relayLogCache = make([]model.RelayLog, 0, relayLogMaxSize)
 	relayLogCacheLock.Unlock()
-	return db.GetDB().WithContext(ctx).Where("1 = 1").Delete(&model.RelayLog{}).Error
+	return nil
 }
 
 func applyRelayLogFilterQuery(query *gorm.DB, filter *model.RelayLogListFilter) *gorm.DB {

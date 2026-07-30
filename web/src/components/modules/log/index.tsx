@@ -1,8 +1,6 @@
-'use client';
-
 import { useCallback, useEffect, useMemo } from 'react';
 import { Loader2 } from 'lucide-react';
-import { useTranslations } from 'next-intl';
+import { useTranslations } from 'use-intl';
 import { useLogs, type LogFilters } from '@/api/endpoints/log';
 import { useGroupList } from '@/api/endpoints/group';
 import { useChannelList } from '@/api/endpoints/channel';

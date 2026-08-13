@@ -46,7 +46,6 @@ cd web && pnpm install && NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8080" pnpm 
 
 # Full build (frontend + backend)
 cd web && pnpm install && pnpm run build && cd ..
-mv web/out static/
 go build -o octopus main.go
 
 # Production build (cross-platform)
